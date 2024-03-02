@@ -1,3 +1,4 @@
+mod dxgi;
 mod keyhook;
 
 use keyhook::HookMessage;
@@ -77,24 +78,26 @@ fn main() -> Result<(), eframe::Error> {
         gtk::main();
     });
 
-    #[cfg(not(target_os = "linux"))]
-    let mut _tray_icon = Rc::new(RefCell::new(None));
-    #[cfg(not(target_os = "linux"))]
-    let tray_c = _tray_icon.clone();
+    // #[cfg(not(target_os = "linux"))]
+    // let mut _tray_icon = Rc::new(RefCell::new(None));
+    // #[cfg(not(target_os = "linux"))]
+    // let tray_c = _tray_icon.clone();
 
-    eframe::run_native(
-        "My egui App",
-        eframe::NativeOptions::default(),
-        Box::new(move |_cc| {
-            #[cfg(not(target_os = "linux"))]
-            {
-                tray_c
-                    .borrow_mut()
-                    .replace(TrayIconBuilder::new().with_icon(icon).build().unwrap());
-            }
-            Box::<MyApp>::default()
-        }),
-    )?;
+    dxgi::show();
+
+    // eframe::run_native(
+    //     "My egui App",
+    //     eframe::NativeOptions::default(),
+    //     Box::new(move |_cc| {
+    //         #[cfg(not(target_os = "linux"))]
+    //         {
+    //             tray_c
+    //                 .borrow_mut()
+    //                 .replace(TrayIconBuilder::new().with_icon(icon).build().unwrap());
+    //         }
+    //         Box::<MyApp>::default()
+    //     }),
+    // )?;
 
     Ok(())
 }
