@@ -1,11 +1,8 @@
-mod dxgi;
-mod keyhook;
-
-use keyhook::HookMessage;
 use std::sync::mpsc::{Receiver, Sender};
 use std::sync::{mpsc, Arc, RwLock};
 use std::thread;
 use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageA, GetMessageA, MSG};
+use windows_lowlevel_hooks::HookMessage;
 
 //#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 use global_hotkey::{
@@ -28,12 +25,12 @@ use eframe::egui;
 use tray_icon::TrayIconBuilder;
 
 fn main() -> Result<(), eframe::Error> {
-    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png");
-    let icon = load_icon(std::path::Path::new(path));
+    // let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png");
+    // let icon = load_icon(std::path::Path::new(path));
 
     let (sender, receiver) = mpsc::channel::<HookMessage>();
     {
-        let mut ks = keyhook::KEY_SENDER.write().unwrap();
+        let mut ks = windows_lowlevel_hooks::KEY_SENDER.write().unwrap();
         ks.insert(sender);
     }
 
@@ -44,7 +41,7 @@ fn main() -> Result<(), eframe::Error> {
         }
     });
 
-    let thread = keyhook::start_thread();
+    let thread = windows_lowlevel_hooks::start_thread();
 
     // let manager = GlobalHotKeyManager::new().unwrap();
 
@@ -83,7 +80,7 @@ fn main() -> Result<(), eframe::Error> {
     // #[cfg(not(target_os = "linux"))]
     // let tray_c = _tray_icon.clone();
 
-    dxgi::show();
+    windows_direct_composition::show();
 
     // eframe::run_native(
     //     "My egui App",
