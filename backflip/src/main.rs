@@ -1,62 +1,33 @@
-use std::sync::mpsc::{Receiver, Sender};
+use arboard::Clipboard;
+use crossbeam_channel::Receiver;
+use global_hotkey::{GlobalHotKeyEventReceiver, HotKeyState};
 use std::sync::{mpsc, Arc, RwLock};
-use std::thread;
-use windows::Win32::UI::WindowsAndMessaging::{DispatchMessageA, GetMessageA, MSG};
-use windows_lowlevel_hooks::HookMessage;
+use std::thread::{self, JoinHandle};
 
 //#![cfg_attr(not(debug_assertions), windows_subsystem = "windows")] // hide console window on Windows in release
 use global_hotkey::{
     hotkey::{Code, HotKey, Modifiers},
     GlobalHotKeyEvent, GlobalHotKeyManager,
 };
-use windows::{
-    core::IUnknown,
-    Win32::{
-        Foundation::{HINSTANCE, LPARAM, LRESULT, WPARAM},
-        UI::WindowsAndMessaging::{self, WH_KEYBOARD_LL},
-    },
-};
 
 #[cfg(not(target_os = "linux"))]
 use std::{cell::RefCell, rc::Rc};
 use std::{ptr::null_mut, time::Duration};
 
-use eframe::egui;
-use tray_icon::TrayIconBuilder;
+use eframe::egui::{self, Context, Key, ViewportCommand, ViewportId};
+use tray_icon::{TrayIconBuilder, TrayIconEvent, TrayIconEventReceiver};
 
 fn main() -> Result<(), eframe::Error> {
-    // let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png");
-    // let icon = load_icon(std::path::Path::new(path));
+    let path = concat!(env!("CARGO_MANIFEST_DIR"), "/assets/icon.png");
+    let icon = load_icon(std::path::Path::new(path));
 
-    let (sender, receiver) = mpsc::channel::<HookMessage>();
-    {
-        let mut ks = windows_lowlevel_hooks::KEY_SENDER.write().unwrap();
-        ks.insert(sender);
-    }
+    let manager = GlobalHotKeyManager::new().unwrap();
 
-    let t = thread::spawn(move || loop {
-        match receiver.recv() {
-            Ok(d) => println!("received: {:?}", d),
-            Err(_) => println!("goodbye"),
-        }
-    });
+    // construct the hotkey
+    let hotkey = HotKey::new(Some(Modifiers::SUPER), Code::Backslash);
 
-    let thread = windows_lowlevel_hooks::start_thread();
-
-    // let manager = GlobalHotKeyManager::new().unwrap();
-
-    // // construct the hotkey
-    // let hotkey = HotKey::new(Some(Modifiers::SUPER), Code::KeyC);
-
-    // // register it
-    // manager.register(hotkey);
-    // let receiver = GlobalHotKeyEvent::receiver();
-    // std::thread::spawn(|| loop {
-    //     if let Ok(event) = receiver.try_recv() {
-    //         println!("hotkey event: {event:?}");
-    //     }
-    //     std::thread::sleep(Duration::from_millis(100));
-    // });
+    // register it
+    manager.register(hotkey);
 
     // Since egui uses winit under the hood and doesn't use gtk on Linux, and we need gtk for
     // the tray icon to show up, we need to spawn a thread
@@ -75,50 +46,156 @@ fn main() -> Result<(), eframe::Error> {
         gtk::main();
     });
 
-    // #[cfg(not(target_os = "linux"))]
-    // let mut _tray_icon = Rc::new(RefCell::new(None));
-    // #[cfg(not(target_os = "linux"))]
-    // let tray_c = _tray_icon.clone();
+    #[cfg(not(target_os = "linux"))]
+    let mut _tray_icon = Rc::new(RefCell::new(None));
+    #[cfg(not(target_os = "linux"))]
+    let tray_c = _tray_icon.clone();
 
-    windows_direct_composition::show();
+    let options = eframe::NativeOptions {
+        viewport: egui::ViewportBuilder::default().with_inner_size([320.0, 240.0]),
 
-    // eframe::run_native(
-    //     "My egui App",
-    //     eframe::NativeOptions::default(),
-    //     Box::new(move |_cc| {
-    //         #[cfg(not(target_os = "linux"))]
-    //         {
-    //             tray_c
-    //                 .borrow_mut()
-    //                 .replace(TrayIconBuilder::new().with_icon(icon).build().unwrap());
-    //         }
-    //         Box::<MyApp>::default()
-    //     }),
-    // )?;
+        ..Default::default()
+    };
+
+    let app = MyApp {
+        name: "aa".to_string(),
+        age: 69,
+        hotkey_receiver: GlobalHotKeyEvent::receiver().clone(),
+        tray_receiver: TrayIconEvent::receiver().clone(),
+        sessions: vec![],
+        wakeup_thread: None,
+        wakeup_requests: None,
+    };
+
+    eframe::run_native(
+        "My egui App",
+        options,
+        Box::new(move |_cc| {
+            #[cfg(not(target_os = "linux"))]
+            {
+                tray_c
+                    .borrow_mut()
+                    .replace(TrayIconBuilder::new().with_icon(icon).build().unwrap());
+            }
+            Box::new(app)
+        }),
+    )?;
 
     Ok(())
 }
 
+struct HotkeyPress {}
+
 struct MyApp {
     name: String,
     age: u32,
+    hotkey_receiver: GlobalHotKeyEventReceiver,
+    tray_receiver: TrayIconEventReceiver,
+    sessions: Vec<Option<Session>>,
+    wakeup_thread: Option<JoinHandle<()>>,
+    wakeup_requests: Option<Receiver<HotkeyPress>>,
 }
 
-impl Default for MyApp {
-    fn default() -> Self {
-        Self {
-            name: "Arthur".to_owned(),
-            age: 42,
-        }
-    }
+struct Session {
+    captured_clipboard: String,
+    viewport_id: ViewportId,
+    title: String,
+    requested_focus: bool,
 }
 
 impl eframe::App for MyApp {
-    fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
+    fn update(&mut self, ctx: &egui::Context, frame: &mut eframe::Frame) {
         use tray_icon::TrayIconEvent;
 
-        if let Ok(event) = TrayIconEvent::receiver().try_recv() {
+        if let None = self.wakeup_thread {
+            let hotkey_receiver = self.hotkey_receiver.clone();
+            let (wakeup_sender, wakeup_receiver) = crossbeam_channel::unbounded();
+            self.wakeup_requests = Some(wakeup_receiver);
+            let ctx = ctx.clone();
+            self.wakeup_thread = Some(std::thread::spawn(move || loop {
+                if let Ok(GlobalHotKeyEvent {
+                    state: HotKeyState::Pressed,
+                    ..
+                }) = hotkey_receiver.recv()
+                {
+                    wakeup_sender.send(HotkeyPress {});
+                    ctx.request_repaint();
+                }
+                std::thread::sleep(Duration::from_millis(100));
+            }));
+        }
+
+        if let Ok(event) = self.tray_receiver.try_recv() {
             println!("tray event: {event:?}");
+        }
+
+        if let Some(recv) = &self.wakeup_requests {
+            if let Ok(event) = recv.try_recv() {
+                self.new_session();
+            }
+        }
+
+        for session in &mut self.sessions {
+            let mut closing = false;
+            if let Some(session) = session {
+                ctx.show_viewport_immediate(
+                    session.viewport_id,
+                    egui::ViewportBuilder::default()
+                        .with_title(&session.title)
+                        .with_inner_size([500.0, 200.0]),
+                    |ctx, class| {
+                        egui::CentralPanel::default().show(ctx, |ui| {
+                            ui.text_edit_multiline(&mut session.captured_clipboard);
+                            ui.label("S: serialize json. X: deserialize json");
+                            ui.label("D: reverse slashes");
+                            ui.label("enter: copy. escape: close.");
+                        });
+
+                        if ctx.input(|i| i.viewport().close_requested()) {
+                            closing = true;
+                        }
+
+                        if ctx.input(|i| i.key_released(Key::Escape)) {
+                            closing = true;
+                        }
+                        if ctx.input(|i| i.key_released(Key::Enter)) {
+                            let mut clipboard = Clipboard::new().unwrap();
+                            clipboard.set_text(&session.captured_clipboard).unwrap();
+                            closing = true;
+                        }
+
+                        if ctx.input(|i| i.key_released(Key::D)) {
+                            session.captured_clipboard = session
+                                .captured_clipboard
+                                .replace("\\", "THISWASABACKSLASH");
+                            session.captured_clipboard =
+                                session.captured_clipboard.replace("/", "\\");
+                            session.captured_clipboard =
+                                session.captured_clipboard.replace("THISWASABACKSLASH", "/");
+                        }
+
+                        if ctx.input(|i| i.key_released(Key::S)) {
+                            session.captured_clipboard =
+                                serde_json::to_string(&session.captured_clipboard).unwrap();
+                        }
+
+                        if ctx.input(|i| i.key_released(Key::A)) {
+                            match serde_json::from_str(&session.captured_clipboard) {
+                                Ok(s) => session.captured_clipboard = s,
+                                Err(_) => (),
+                            }
+                        }
+                    },
+                );
+                if session.requested_focus {
+                    session.requested_focus = false;
+                    ctx.send_viewport_cmd_to(session.viewport_id, ViewportCommand::Focus);
+                }
+            }
+            if closing {
+                // Remove the session
+                _ = session.take();
+            }
         }
 
         egui::CentralPanel::default().show(ctx, |ui| {
@@ -134,6 +211,40 @@ impl eframe::App for MyApp {
             }
             ui.label(format!("Hello '{}', age {}", self.name, self.age));
         });
+    }
+}
+
+impl MyApp {
+    pub fn new_session(&mut self) -> anyhow::Result<()> {
+        let mut captured_clipboard: Option<String> = None;
+
+        #[cfg(target_os = "windows")]
+        {
+            use clipboard_win::{formats, get_clipboard, set_clipboard};
+            captured_clipboard = match clipboard_win::get_clipboard_string() {
+                Ok(s) => Some(s),
+                Err(_) => match clipboard_win::get_clipboard(formats::FileList) {
+                    Ok(files) => Some(files.join(",")),
+                    Err(_) => None,
+                },
+            };
+        }
+        #[cfg(not(target_os = "windows"))]
+        {
+            let mut clipboard = Clipboard::new().unwrap();
+            captured_clipboard = clipboard.get_text()?;
+        }
+
+        if let Some(c) = captured_clipboard {
+            let s = Session {
+                captured_clipboard: c,
+                viewport_id: ViewportId::from_hash_of(format!("session-{}", self.sessions.len())),
+                title: format!("backflip {}", self.sessions.len()),
+                requested_focus: true,
+            };
+            self.sessions.push(Some(s));
+        }
+        Ok(())
     }
 }
 

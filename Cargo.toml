@@ -1,6 +1,7 @@
 [workspace]
 members = [
     "backflip",
+    "backflip-launcher",
     "overlay-app",
     "windows_direct_composition",
     "windows_lowlevel_hooks",

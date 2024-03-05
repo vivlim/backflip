@@ -1,0 +1,5 @@
+{
+    "rust-analyzer.linkedProjects": [
+        ".\\backflip-launcher\\Cargo.toml"
+    ]
+}
